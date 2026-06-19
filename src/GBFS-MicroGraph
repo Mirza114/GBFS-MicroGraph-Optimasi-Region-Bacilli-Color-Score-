@@ -1,0 +1,574 @@
+import cv2
+import numpy as np
+import pandas as pd
+import time
+import heapq
+from pathlib import Path
+
+GT_FOLDER = None
+
+IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
+
+CONNECTIVITY = 8
+
+SEED_PERCENTILE = 98.5
+MIN_SEED_SCORE = 0.35
+MAX_SEEDS = 20
+
+GROW_MIN_SCORE = 0.18
+RELAXED_SCORE = 0.13
+
+MAX_LAB_DISTANCE = 42.0
+
+MAX_REGION_RATIO = 0.35
+
+MIN_COMPONENT_AREA = 5
+
+
+def read_image(image_path):
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise ValueError(f"Gambar tidak bisa dibaca: {image_path}")
+
+    return image
+
+
+def get_all_image_files(input_folder):
+    input_folder = Path(input_folder)
+
+    image_files = [
+        p for p in input_folder.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+    return sorted(image_files, key=lambda p: p.name)
+
+
+def find_gt_mask(image_path, gt_folder):
+    if gt_folder is None:
+        return None
+
+    gt_folder = Path(gt_folder)
+    image_path = Path(image_path)
+
+    for ext in IMAGE_EXTENSIONS:
+        candidate = gt_folder / f"{image_path.stem}{ext}"
+
+        if candidate.exists():
+            gt = cv2.imread(str(candidate), cv2.IMREAD_GRAYSCALE)
+
+            if gt is not None:
+                return gt > 127
+
+    return None
+
+def normalize_channel(channel):
+    channel = channel.astype(np.float32)
+    min_val = np.min(channel)
+    max_val = np.max(channel)
+
+    if max_val - min_val < 1e-6:
+        return np.zeros_like(channel, dtype=np.float32)
+
+    return (channel - min_val) / (max_val - min_val)
+
+
+def bacilli_color_score(image_bgr):
+
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+
+    h = hsv[:, :, 0].astype(np.float32)
+    s = hsv[:, :, 1].astype(np.float32) / 255.0
+
+    a_channel = lab[:, :, 1]
+    a_norm = normalize_channel(a_channel)
+
+    red_distance = np.minimum(np.abs(h - 0), np.abs(h - 179))
+    red_score = 1.0 - np.clip(red_distance / 25.0, 0.0, 1.0)
+
+    purple_distance = np.abs(h - 150)
+    purple_score = 1.0 - np.clip(purple_distance / 35.0, 0.0, 1.0)
+
+    hue_score = np.maximum(red_score, purple_score)
+
+    score = (0.60 * hue_score * s) + (0.40 * a_norm)
+    score = np.clip(score, 0.0, 1.0)
+
+    return score
+
+def get_neighbors(y, x, height, width, connectivity=8):
+    if connectivity == 4:
+        directions = [
+            (-1, 0), (1, 0), (0, -1), (0, 1)
+        ]
+    else:
+        directions = [
+            (-1, 0), (1, 0), (0, -1), (0, 1),
+            (-1, -1), (-1, 1), (1, -1), (1, 1)
+        ]
+
+    for dy, dx in directions:
+        ny = y + dy
+        nx = x + dx
+
+        if 0 <= ny < height and 0 <= nx < width:
+            yield ny, nx
+
+
+def select_seed_points(score):
+
+    threshold = np.percentile(score, SEED_PERCENTILE)
+    threshold = max(threshold, MIN_SEED_SCORE)
+
+    seed_mask = score >= threshold
+    seed_uint8 = seed_mask.astype(np.uint8)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        seed_uint8,
+        connectivity=CONNECTIVITY
+    )
+
+    seeds = []
+
+    for label_id in range(1, num_labels):
+        coords = np.argwhere(labels == label_id)
+
+        if len(coords) == 0:
+            continue
+
+        best_idx = np.argmax(score[coords[:, 0], coords[:, 1]])
+        y, x = coords[best_idx]
+
+        seeds.append({
+            "y": int(y),
+            "x": int(x),
+            "score": float(score[y, x])
+        })
+
+    seeds = sorted(seeds, key=lambda s: s["score"], reverse=True)
+    seeds = seeds[:MAX_SEEDS]
+
+    return seeds, seed_mask
+
+
+def lab_distance(lab_image, y1, x1, y2, x2):
+    p1 = lab_image[y1, x1].astype(np.float32)
+    p2 = lab_image[y2, x2].astype(np.float32)
+
+    return float(np.linalg.norm(p1 - p2))
+
+
+def priority_value(score_val, color_distance):
+
+    color_penalty = min(color_distance / MAX_LAB_DISTANCE, 1.0)
+    value = (0.75 * score_val) + (0.25 * (1.0 - color_penalty))
+
+    return -value
+
+
+def gbfs_region_growing(image_bgr, score, seeds):
+
+    height, width = score.shape
+    total_pixels = height * width
+    max_region_pixels = int(total_pixels * MAX_REGION_RATIO)
+
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+
+    final_mask = np.zeros((height, width), dtype=bool)
+    visited = np.zeros((height, width), dtype=bool)
+
+    region_records = []
+
+    for seed_id, seed in enumerate(seeds, start=1):
+        sy = seed["y"]
+        sx = seed["x"]
+
+        if visited[sy, sx]:
+            continue
+
+        seed_lab_y = sy
+        seed_lab_x = sx
+
+        local_region = []
+        heap = []
+
+        initial_priority = priority_value(score[sy, sx], 0.0)
+        heapq.heappush(heap, (initial_priority, sy, sx))
+        visited[sy, sx] = True
+
+        while heap:
+            _, cy, cx = heapq.heappop(heap)
+
+            color_dist = lab_distance(lab, seed_lab_y, seed_lab_x, cy, cx)
+            current_score = float(score[cy, cx])
+
+            strong_accept = current_score >= GROW_MIN_SCORE and color_dist <= MAX_LAB_DISTANCE
+            relaxed_accept = current_score >= RELAXED_SCORE and color_dist <= (MAX_LAB_DISTANCE * 0.65)
+
+            if not (strong_accept or relaxed_accept):
+                continue
+
+            local_region.append((cy, cx))
+
+            if len(local_region) >= max_region_pixels:
+                break
+
+            for ny, nx in get_neighbors(cy, cx, height, width, CONNECTIVITY):
+                if visited[ny, nx]:
+                    continue
+
+                visited[ny, nx] = True
+
+                ndist = lab_distance(lab, seed_lab_y, seed_lab_x, ny, nx)
+                nscore = float(score[ny, nx])
+
+                if nscore < RELAXED_SCORE and ndist > (MAX_LAB_DISTANCE * 0.75):
+                    continue
+
+                p = priority_value(nscore, ndist)
+                heapq.heappush(heap, (p, ny, nx))
+
+        if len(local_region) > 0:
+            for y, x in local_region:
+                final_mask[y, x] = True
+
+            region_records.append({
+                "seed_id": seed_id,
+                "seed_y": sy,
+                "seed_x": sx,
+                "seed_score": seed["score"],
+                "region_size": len(local_region)
+            })
+
+    return final_mask, region_records
+
+def remove_small_components(mask, min_area=5, connectivity=8):
+    mask_uint8 = mask.astype(np.uint8)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_uint8,
+        connectivity=connectivity
+    )
+
+    cleaned = np.zeros_like(mask_uint8)
+
+    for label_id in range(1, num_labels):
+        area = stats[label_id, cv2.CC_STAT_AREA]
+
+        if area >= min_area:
+            cleaned[labels == label_id] = 1
+
+    return cleaned.astype(bool)
+
+def compute_iou(pred_mask, gt_mask):
+    if gt_mask is None:
+        return None
+
+    pred = pred_mask.astype(bool)
+    gt = gt_mask.astype(bool)
+
+    intersection = np.logical_and(pred, gt).sum()
+    union = np.logical_or(pred, gt).sum()
+
+    if union == 0:
+        return 0.0
+
+    return intersection / union
+
+
+def unsupervised_objective(score, mask):
+
+    foreground_pixels = int(mask.sum())
+
+    if foreground_pixels == 0:
+        return 0.0
+
+    foreground_ratio = foreground_pixels / mask.size
+
+    fg_score = float(np.mean(score[mask]))
+
+    if np.any(~mask):
+        bg_score = float(np.mean(score[~mask]))
+    else:
+        bg_score = 0.0
+
+    separation = fg_score - bg_score
+
+    if foreground_ratio < 0.0005:
+        area_penalty = 0.25
+    elif foreground_ratio > 0.35:
+        area_penalty = 0.45
+    else:
+        area_penalty = 0.0
+
+    objective = (
+        0.60 * fg_score
+        + 0.40 * separation
+        - area_penalty
+    )
+
+    return float(max(objective, 0.0))
+
+
+def get_statistics(mask):
+    mask_uint8 = mask.astype(np.uint8)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_uint8,
+        connectivity=CONNECTIVITY
+    )
+
+    component_count = max(num_labels - 1, 0)
+    foreground_pixels = int(mask.sum())
+
+    if component_count > 0:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        min_area = int(np.min(areas))
+        max_area = int(np.max(areas))
+        mean_area = float(np.mean(areas))
+    else:
+        min_area = 0
+        max_area = 0
+        mean_area = 0.0
+
+    return {
+        "component_count": component_count,
+        "foreground_pixels": foreground_pixels,
+        "foreground_ratio": float(foreground_pixels / mask.size),
+        "min_area": min_area,
+        "max_area": max_area,
+        "mean_area": mean_area
+    }
+
+def save_score_heatmap(score, output_path):
+    score_img = (score * 255).astype(np.uint8)
+    heatmap = cv2.applyColorMap(score_img, cv2.COLORMAP_JET)
+    cv2.imwrite(str(output_path), heatmap)
+
+
+def save_mask(mask, output_path):
+    mask_img = (mask.astype(np.uint8) * 255)
+    cv2.imwrite(str(output_path), mask_img)
+
+
+def save_overlay(image_bgr, mask, output_path):
+    overlay = image_bgr.copy()
+
+    mask_uint8 = (mask.astype(np.uint8) * 255)
+
+    contours, _ = cv2.findContours(
+        mask_uint8,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    cv2.drawContours(overlay, contours, -1, (0, 255, 0), 1)
+
+    blended = cv2.addWeighted(image_bgr, 0.75, overlay, 0.25, 0)
+
+    cv2.imwrite(str(output_path), blended)
+
+
+def save_seed_preview(image_bgr, seeds, output_path):
+    preview = image_bgr.copy()
+
+    for seed in seeds:
+        y = seed["y"]
+        x = seed["x"]
+        cv2.circle(preview, (x, y), 3, (0, 255, 255), -1)
+
+    cv2.imwrite(str(output_path), preview)
+
+def process_one_image(image_path, output_folder, gt_folder=None):
+    image_path = Path(image_path)
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    image_bgr = read_image(image_path)
+    gt_mask = find_gt_mask(image_path, gt_folder)
+
+    start_time = time.perf_counter()
+
+    score = bacilli_color_score(image_bgr)
+    seeds, seed_mask = select_seed_points(score)
+
+    raw_mask, region_records = gbfs_region_growing(
+        image_bgr=image_bgr,
+        score=score,
+        seeds=seeds
+    )
+
+    final_mask = remove_small_components(
+        raw_mask,
+        min_area=MIN_COMPONENT_AREA,
+        connectivity=CONNECTIVITY
+    )
+
+    end_time = time.perf_counter()
+    runtime = end_time - start_time
+
+    iou = compute_iou(final_mask, gt_mask)
+
+    if iou is not None:
+        objective = iou
+        objective_type = "IoU"
+    else:
+        objective = unsupervised_objective(score, final_mask)
+        objective_type = "Unsupervised"
+
+    stats = get_statistics(final_mask)
+
+    name = image_path.stem
+
+    save_score_heatmap(
+        score,
+        output_folder / f"{name}_01_bacilli_score_heatmap.png"
+    )
+
+    save_seed_preview(
+        image_bgr,
+        seeds,
+        output_folder / f"{name}_02_seed_preview.png"
+    )
+
+    save_mask(
+        seed_mask,
+        output_folder / f"{name}_03_seed_mask.png"
+    )
+
+    save_mask(
+        raw_mask,
+        output_folder / f"{name}_04_raw_gbfs_mask.png"
+    )
+
+    save_mask(
+        final_mask,
+        output_folder / f"{name}_05_final_gbfs_mask.png"
+    )
+
+    save_overlay(
+        image_bgr,
+        final_mask,
+        output_folder / f"{name}_06_overlay.png"
+    )
+
+    region_df = pd.DataFrame(region_records)
+    region_df.to_csv(output_folder / f"{name}_region_records.csv", index=False)
+
+    summary = {
+        "image": image_path.name,
+        "method": "GBFS-MicroSeg",
+        "strategy_algorithm": "Greedy Best-First Search",
+        "objective_type": objective_type,
+        "objective": float(objective),
+        "iou": float(iou) if iou is not None else None,
+        "runtime_seconds": runtime,
+        "seed_count": len(seeds),
+        "region_count": len(region_records),
+        "gt_used": "Yes" if gt_mask is not None else "No"
+    }
+
+    summary.update(stats)
+
+    return summary
+
+
+def process_folder(input_folder, output_folder, gt_folder=None):
+    input_folder = Path(input_folder)
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    image_files = get_all_image_files(input_folder)
+
+    if len(image_files) == 0:
+        print("Tidak ada citra ditemukan.")
+        return
+
+    summaries = []
+    failed_rows = []
+
+    print(f"Jumlah citra ditemukan: {len(image_files)}")
+    print(f"Input : {input_folder}")
+    print(f"Output: {output_folder}")
+    print()
+
+    for idx, image_path in enumerate(image_files, start=1):
+        print(f"[{idx}/{len(image_files)}] Memproses: {image_path.name}")
+
+        try:
+            summary = process_one_image(
+                image_path=image_path,
+                output_folder=output_folder,
+                gt_folder=gt_folder
+            )
+
+            summaries.append(summary)
+
+            print(
+                f"  Objective: {summary['objective']:.4f} | "
+                f"Component: {summary['component_count']} | "
+                f"Foreground: {summary['foreground_pixels']} | "
+                f"Seeds: {summary['seed_count']} | "
+                f"Regions: {summary['region_count']} | "
+                f"Runtime: {summary['runtime_seconds'] * 1000:.3f} ms"
+            )
+
+        except Exception as e:
+            failed_rows.append({
+                "image": image_path.name,
+                "error": str(e)
+            })
+
+            print(f"  ERROR pada {image_path.name}: {e}")
+
+    summary_df = pd.DataFrame(summaries)
+
+    summary_path = output_folder / "gbfs_microseg_summary.csv"
+    ablation_path = output_folder / "gbfs_microseg_ablation_table.csv"
+    failed_path = output_folder / "gbfs_microseg_failed_log.csv"
+
+    summary_df.to_csv(summary_path, index=False)
+
+    if len(failed_rows) > 0:
+        failed_df = pd.DataFrame(failed_rows)
+        failed_df.to_csv(failed_path, index=False)
+
+    if len(summary_df) > 0:
+        ablation_row = {
+            "Metode": "GBFS-MicroSeg",
+            "Strategi Algoritma": "Greedy Best-First Search",
+            "Jumlah Citra Diproses": len(summary_df),
+            "Jumlah Citra Gagal": len(failed_rows),
+            "Rata-rata Objective": summary_df["objective"].mean(),
+            "Rata-rata IoU": summary_df["iou"].mean() if summary_df["iou"].notna().any() else None,
+            "Rata-rata Komponen": summary_df["component_count"].mean(),
+            "Rata-rata Foreground Pixel": summary_df["foreground_pixels"].mean(),
+            "Rata-rata Seed Count": summary_df["seed_count"].mean(),
+            "Rata-rata Region Count": summary_df["region_count"].mean(),
+            "Rata-rata Runtime (ms)": summary_df["runtime_seconds"].mean() * 1000
+        }
+
+        ablation_df = pd.DataFrame([ablation_row])
+        ablation_df.to_csv(ablation_path, index=False)
+
+        print()
+        print("Tabel ablasi:")
+        print(ablation_df)
+
+    print()
+    print("Selesai.")
+    print(f"Ringkasan utama: {summary_path}")
+    print(f"Tabel ablasi: {ablation_path}")
+
+    if len(failed_rows) > 0:
+        print(f"Log citra gagal: {failed_path}")
+    
+
+if __name__ == "__main__":
+    process_folder(
+        input_folder=INPUT_FOLDER,
+        output_folder=OUTPUT_FOLDER,
+        gt_folder=GT_FOLDER
+    )
